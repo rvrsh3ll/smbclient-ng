@@ -4,7 +4,7 @@
 # Author             : Podalirius (@podalirius_)
 # Date created       : 23 may 2024
 
-
+from __future__ import annotations
 import datetime
 import fnmatch
 import ntpath
@@ -12,9 +12,16 @@ import os
 import re
 import socket
 import stat
+from impacket.smbconnection import SessionError
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from typing import Optional
+    from impacket.smb import SharedFile
+    from smbclientng.core.Config import Config
+    from smbclientng.core.SMBSession import SMBSession
 
-def parse_lm_nt_hashes(lm_nt_hashes_string):
+def parse_lm_nt_hashes(lm_nt_hashes_string: str) -> tuple[str, str]:
     """
     Parse the input string containing LM and NT hash values and return them separately.
 
@@ -50,7 +57,7 @@ def parse_lm_nt_hashes(lm_nt_hashes_string):
     return lm_hash_value, nt_hash_value
 
 
-def b_filesize(l):
+def b_filesize(l: int) -> str:
     """
     Convert a file size from bytes to a more readable format using the largest appropriate unit.
 
@@ -72,7 +79,7 @@ def b_filesize(l):
     return "%4.2f %s" % (round(l/(1024**(k)),2), units[k])
 
 
-def unix_permissions(entryname):
+def unix_permissions(entryname: str) -> str:
     """
     Generate a string representing the Unix-style permissions for a given file or directory.
 
@@ -109,7 +116,7 @@ def unix_permissions(entryname):
     return ''.join(permissions)
 
 
-def STYPE_MASK(stype_value):
+def STYPE_MASK(stype_value: int) -> list[str]:
     """
     Extracts the share type flags from a given share type value.
 
@@ -145,7 +152,7 @@ def STYPE_MASK(stype_value):
         # A temporary share.
         "STYPE_TEMPORARY": 0x40000000
     }
-    flags = []
+    flags : list[str] = []
     if (stype_value & 0b11) == known_flags["STYPE_DISKTREE"]:
         flags.append("STYPE_DISKTREE")
     elif (stype_value & 0b11) == known_flags["STYPE_PRINTQ"]:
@@ -161,7 +168,7 @@ def STYPE_MASK(stype_value):
     return flags
 
 
-def windows_ls_entry(entry, config, pathToPrint=None):
+def windows_ls_entry(entry: SharedFile, config: Config, pathToPrint: Optional[str] =None):
     """
     This function generates a metadata string based on the attributes of the provided entry object.
     
@@ -206,7 +213,7 @@ def windows_ls_entry(entry, config, pathToPrint=None):
     return output_str
 
 
-def local_tree(path, config):
+def local_tree(path: str, config: Config):
     """
     This function recursively lists the contents of a directory in a tree-like format.
 
@@ -328,7 +335,7 @@ def local_tree(path, config):
         print("[!] Interrupted.")
 
 
-def resolve_local_files(arguments):
+def resolve_local_files(arguments: list[str]) -> list[str]:
     """
     Resolves local file paths based on the provided arguments.
 
@@ -343,7 +350,7 @@ def resolve_local_files(arguments):
         list: A list of resolved file paths that match the provided arguments.
     """
 
-    resolved_files = []
+    resolved_files: list[str] = []
     for arg in arguments:
         if '*' in arg:
             try:
@@ -360,7 +367,7 @@ def resolve_local_files(arguments):
     return resolved_files
 
 
-def resolve_remote_files(smbSession, arguments):
+def resolve_remote_files(smbSession: SMBSession, arguments: list[str]) -> list[str]:
     """
     Resolves remote file paths based on the provided arguments using an SMB session.
 
@@ -381,78 +388,76 @@ def resolve_remote_files(smbSession, arguments):
     resolved_pathFromRoot_files = []
     for arg in arguments:
         # Parse argument values
-        if DEBUG: print("[debug] Parsing argument '%s'" % arg)
+        if DEBUG: print(f"[debug] Parsing argument '{arg}'")
+
+        # Handle wildcard '*'
         if arg == '*':
             if DEBUG: print("[debug] |--> Argument is a wildcard")
             # Find all the remote files in current directory
-            # Path types:
-            # *
+            cwd = smbSession.smb_cwd or ntpath.sep  # Ensure cwd is not empty
+            search_path = ntpath.join(cwd, '*')
             contents = smbSession.smbClient.listPath(
                 shareName=smbSession.smb_share,
-                path=(smbSession.smb_cwd + ntpath.sep + '*')
+                path=search_path
             )
             contents = [e for e in contents if e.get_longname() not in ['.', '..']]
             for entry in contents:
-                resolved_pathFromRoot_files.append(
-                    ntpath.sep + ntpath.join(smbSession.smb_cwd, entry.get_longname())
-                )
-        
-        # Relative paths
+                # Construct absolute path starting from the root
+                resolved_path = ntpath.normpath(ntpath.join(ntpath.sep, cwd, entry.get_longname()))
+                resolved_pathFromRoot_files.append(resolved_path)
+
+        # Handle relative paths
         elif not arg.startswith(ntpath.sep):
-            if arg.endswith('*'):
-                if DEBUG: print("[debug] |--> Argument is a relative path LIKE this path")
-                # Find all the remote relative paths LIKE this path
-                # Path types:
-                # Users/*
-                # Users/Admi*
+            # Get the full path relative to the current working directory
+            full_arg_path = ntpath.join(smbSession.smb_cwd, arg)
+            if '*' in arg:
+                if DEBUG: print("[debug] |--> Argument is a relative path with wildcard")
+                # Get the directory and pattern
+                dir_name = ntpath.dirname(full_arg_path) or smbSession.smb_cwd
+                pattern = ntpath.basename(arg)
+                search_path = ntpath.join(dir_name, '*')
                 contents = smbSession.smbClient.listPath(
                     shareName=smbSession.smb_share,
-                    path=(ntpath.dirname(arg) + ntpath.sep + '*')
+                    path=search_path
                 )
                 contents = [e for e in contents if e.get_longname() not in ['.', '..']]
                 for entry in contents:
-                    if fnmatch.fnmatch(entry.get_longname(), ntpath.basename(arg)):
-                        resolved_pathFromRoot_files.append(
-                            ntpath.sep + ntpath.join(smbSession.smb_cwd, ntpath.dirname(arg), entry.get_longname())
-                        )
+                    if fnmatch.fnmatch(entry.get_longname(), pattern):
+                        resolved_path = ntpath.normpath(ntpath.join(ntpath.sep, dir_name, entry.get_longname()))
+                        resolved_pathFromRoot_files.append(resolved_path)
             else:
                 if DEBUG: print("[debug] |--> Argument is a relative path")
-                # Find all the remote files in absolute path to directory
-                resolved_pathFromRoot_files.append(
-                    ntpath.sep + smbSession.smb_cwd + ntpath.sep + arg
-                )
+                resolved_path = ntpath.normpath(ntpath.join(ntpath.sep, smbSession.smb_cwd, arg))
+                resolved_pathFromRoot_files.append(resolved_path)
 
-        # Absolute paths
+        # Handle absolute paths
         elif arg.startswith(ntpath.sep):
-            if arg.endswith('*'):
-                if DEBUG: print("[debug] |--> Argument is a abolute path LIKE this path")
-                # Find all the remote absolute files LIKE this path
-                # Path types:
-                # /Users/*
-                # /Users/Admi*
+            if '*' in arg:
+                if DEBUG: print("[debug] |--> Argument is an absolute path with wildcard")
+                dir_name = ntpath.dirname(arg) or ntpath.sep
+                pattern = ntpath.basename(arg)
+                search_path = ntpath.join(dir_name, '*')
                 contents = smbSession.smbClient.listPath(
                     shareName=smbSession.smb_share,
-                    path=(ntpath.dirname(arg) + ntpath.sep + '*')
+                    path=search_path
                 )
                 contents = [e for e in contents if e.get_longname() not in ['.', '..']]
                 for entry in contents:
-                    if fnmatch.fnmatch(entry.get_longname(), ntpath.basename(arg)):
-                        resolved_pathFromRoot_files.append(
-                            ntpath.sep + ntpath.join(ntpath.dirname(arg), entry.get_longname())
-                        )
+                    if fnmatch.fnmatch(entry.get_longname(), pattern):
+                        resolved_path = ntpath.normpath(ntpath.join(dir_name, entry.get_longname()))
+                        resolved_pathFromRoot_files.append(resolved_path)
             else:
-                if DEBUG: print("[debug] |--> Argument is a absolute path")
-                # Add absolute path to directory
-                resolved_pathFromRoot_files.append(
-                    ntpath.sep + arg
-                )
+                if DEBUG: print("[debug] |--> Argument is an absolute path")
+                resolved_path = ntpath.normpath(arg)
+                resolved_pathFromRoot_files.append(resolved_path)
 
-    resolved_pathFromRoot_files = sorted(list(set(resolved_pathFromRoot_files)))
-    
+    # Remove duplicates and sort
+    resolved_pathFromRoot_files = sorted(set(resolved_pathFromRoot_files))
+
     return resolved_pathFromRoot_files
 
 
-def is_port_open(target, port, timeout):
+def is_port_open(target: str, port: int, timeout: float) -> tuple[bool, Optional[str]]:
     """
     Check if a specific port on a target host is open.
 
@@ -476,3 +481,185 @@ def is_port_open(target, port, timeout):
             return True, None
     except Exception as e:
         return False, str(e)
+
+    
+def smb_entry_iterator(smb_client, smb_share: str, start_paths: list[str], exclusion_rules=[], max_depth: Optional[int] = None, min_depth: int = 0, current_depth: int = 0, filters: Optional[dict] = None):
+    """
+    Iterates over SMB entries by traversing directories in a depth-first manner.
+
+    This function recursively traverses through directories on an SMB share, yielding
+    each entry found along with its full path, current depth, and information on whether
+    it is the last entry in its directory.
+
+    Args:
+        smb_client: The SMB client instance used to interact with the remote share.
+        smb_share (str): The name of the SMB share being traversed.
+        start_paths (list): A list of initial paths to start traversing from.
+        exclusion_rules (list): Rules to exclude certain directories from traversal.
+        max_depth (int, optional): The maximum depth to traverse. If None, no depth limit is applied.
+        current_depth (int): The current depth of traversal in the directory hierarchy.
+
+    Yields:
+        tuple: A tuple containing:
+            - entry: The current SMB entry object (e.g., file or directory).
+            - fullpath (str): The full path to the current entry.
+            - depth (int): The current depth level of the entry within the traversal.
+            - is_last_entry (bool): True if the entry is the last within its directory, False otherwise.
+    """
+    def entry_matches_filters(entry, filters) -> bool:
+        """
+        Checks if an entry matches the provided filters.
+
+        Args:
+            entry: The SMB entry to check.
+            filters (dict): Dictionary of filters.
+
+        Returns:
+            bool: True if the entry matches the filters, False otherwise.
+        """
+        # Filter by type
+        entry_type = 'd' if entry.is_directory() else 'f'
+        if 'type' in filters and filters['type'] != entry_type:
+            return False
+
+        # Filter by name (case-sensitive)
+        if 'name' in filters:
+            name_patterns = filters['name']
+            if isinstance(name_patterns, str):
+                name_patterns = [name_patterns]
+            if not any(fnmatch.fnmatchcase(entry_name, pattern) for pattern in name_patterns):
+                return False
+
+        # Filter by name (case-insensitive)
+        if 'iname' in filters:
+            iname_patterns = filters['iname']
+            if isinstance(iname_patterns, str):
+                iname_patterns = [iname_patterns]
+            entry_name_lower = entry_name.lower()
+            if not any(fnmatch.fnmatch(entry_name_lower, pattern.lower()) for pattern in iname_patterns):
+                return False
+
+        # Filter by size
+        if 'size' in filters and not entry.is_directory():
+            size_filter = filters['size']
+            size = entry.get_filesize()
+            if not size_matches_filter(size, size_filter):
+                return False
+
+        return True
+
+    def size_matches_filter(size: int, size_filter: str) -> bool:
+        """
+        Checks if a size matches the size filter.
+
+        Args:
+            size (int): The size in bytes.
+            size_filter (str): The size filter string (e.g., '+1M', '-500K').
+
+        Returns:
+            bool: True if the size matches the filter, False otherwise.
+        """
+        import re
+
+        match = re.match(r'([+-]?)(\d+)([BKMGTP]?)', size_filter, re.IGNORECASE)
+        if not match:
+            return False
+
+        operator, number, unit = match.groups()
+        number = int(number)
+        unit_multipliers = {'': 1, 'B': 1, 'K': 1024, 'M': 1024**2,
+                            'G': 1024**3, 'T': 1024**4, 'P': 1024**5}
+        multiplier = unit_multipliers.get(unit.upper(), 1)
+        threshold = number * multiplier
+
+        if operator == '+':
+            return size >= threshold
+        elif operator == '-':
+            return size <= threshold
+        else:
+            return size == threshold
+
+    # Entrypoint
+    for base_path in start_paths:
+        try:
+            entries = smb_client.listPath(
+                shareName=smb_share,
+                path=ntpath.join(base_path, '*')
+            )
+
+            entries = [e for e in entries if e.get_longname() not in ['.', '..']]
+            entries.sort(key=lambda e: (not e.is_directory(), e.get_longname().lower()))
+
+            entries_count = len(entries)
+            for index, entry in enumerate(entries):
+                # Determine if this is the last entry in the directory
+                is_last_entry = (index == entries_count - 1)
+                entry_name = entry.get_longname()
+                fullpath = ntpath.join(base_path, entry_name)
+
+                # Apply exclusion rules
+                exclude = False
+                for rule in exclusion_rules:
+                    dirname = rule['dirname']
+                    depth = rule.get('depth', -1)
+                    case_sensitive = rule.get('case_sensitive', True)
+                    match_name = entry_name if case_sensitive else entry_name.lower()
+                    match_dirname = dirname if case_sensitive else dirname.lower()
+
+                    if match_name == match_dirname and (depth == -1 or current_depth <= depth):
+                        exclude = True
+                        break
+
+                if exclude:
+                    continue
+
+                # Apply depth filtering
+                if (max_depth is not None and current_depth > max_depth) or current_depth < min_depth:
+                    continue
+
+                # Recursion for directories
+                if entry.is_directory():
+                    yield_dir = True
+                    if filters:
+                        # Check if 'type' filter is specified
+                        if 'type' in filters:
+                            if filters['type'] == 'd':
+                                yield_dir = True
+                            else:
+                                yield_dir = False
+                        else:
+                            # Filters are applied, but 'type' is not specified
+                            # Assume filters are for files, prevent directory from being yielded
+                            yield_dir = False
+                    else:
+                        # No filters, yield directories
+                        yield_dir = True
+
+                    # Yield the directory if it matches the criteria
+                    if yield_dir:
+                        yield entry, fullpath, current_depth, is_last_entry
+
+                    if max_depth is None or current_depth < max_depth:
+                        yield from smb_entry_iterator(
+                            smb_client=smb_client,
+                            smb_share=smb_share,
+                            start_paths=[fullpath],
+                            exclusion_rules=exclusion_rules,
+                            max_depth=max_depth,
+                            min_depth=min_depth,
+                            current_depth=current_depth + 1,
+                            filters=filters
+                        )
+                else:
+                    # Apply filters
+                    if filters:
+                        if not entry_matches_filters(entry, filters):
+                            continue
+
+                    # Yield the file
+                    yield entry, fullpath, current_depth, is_last_entry
+
+        except SessionError as err:
+            message = f"{err}. Base path: {base_path}"
+            print("[\x1b[1;91merror\x1b[0m] %s" % message)
+            continue

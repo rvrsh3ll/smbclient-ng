@@ -12,6 +12,7 @@
 
 ## Features
 
+- [x] `acls`: List ACLs of files and folders in cwd. Syntax: `acls`
 - [x] `bat`: Pretty prints the contents of a file. Syntax: `bat <file>`
 - [x] `cat`: Get the contents of a file. Syntax: `cat <file>`
 - [x] `cd`: Change the current working directory. Syntax: `cd <directory>`
@@ -52,17 +53,26 @@
 
 ## Install
 
-To install `smbclient-ng`, you can use pip. Run the following command in your terminal:
+To install `smbclient-ng`, you can use `pip`, `pip3` or `pipx`. You can run any of the following command in your terminal to install [smbclient-ng](https://github.com/p0dalirius/smbclient-ng) :
 
-```
-python3 -m pip install smbclientng
-```
++ With `pip`:
+    ```
+    python3 -m pip install smbclientng
+    ```
 
++ With `pip3`:
+    ```
+    pip3 install smbclientng
+    ```
+    
++ With `pipx`:
+    ```
+    pipx install smbclientng
+    ```
 
 ## Demonstration
 
 ![](./.github/example.png)
-
 
 ## Usage
 
@@ -73,9 +83,11 @@ $ ./smbclient-ng.py
 / __| '_ ` _ \| '_ \ / __| | |/ _ \ '_ \| __|____| '_ \ / _` |
 \__ \ | | | | | |_) | (__| | |  __/ | | | ||_____| | | | (_| |
 |___/_| |_| |_|_.__/ \___|_|_|\___|_| |_|\__|    |_| |_|\__, |
-    by @podalirius_                             v2.1.5  |___/  
+    by @podalirius_                             v2.1.6  |___/  
     
-usage: smbclient-ng.py [-h] [--debug] [--no-colors] [-S startup_script] [-N] [-L LOGFILE] --host HOST [--port PORT] [--kdcHost FQDN KDC] [-d DOMAIN] [-u USER] [--no-pass | -p [PASSWORD] | -H [LMHASH:]NTHASH | --aes-key hex key] [-k]
+usage: smbclient-ng.py [-h] [--debug] [--no-colors] [-S startup_script] [-N] [-L LOGFILE] [--timeout TIMEOUT]
+                       [--advertised-name ADVERTISED_NAME] --host HOST [--port PORT] [--kdcHost FQDN KDC] [-d DOMAIN] [-u USER]
+                       [--no-pass | -p [PASSWORD] | -H [LMHASH:]NTHASH | --aes-key hex key] [-k]
 
 smbclient-ng, a fast and user friendly way to interact with SMB shares.
 
@@ -89,6 +101,9 @@ options:
                         Non interactive mode.
   -L LOGFILE, --logfile LOGFILE
                         File to write logs to.
+  --timeout TIMEOUT     Timeout in seconds for SMB connections (default: 3)
+  --advertised-name ADVERTISED_NAME
+                        Advertised name of your machine to the SMB client.
 
 Target:
   --host HOST           IP address or hostname of the SMB Server to connect to.
@@ -106,18 +121,16 @@ Authentication & connection:
   -H [LMHASH:]NTHASH, --hashes [LMHASH:]NTHASH
                         NT/LM hashes, format is LMhash:NThash.
   --aes-key hex key     AES key to use for Kerberos Authentication (128 or 256 bits).
-  -k, --kerberos        Use Kerberos authentication. Grabs credentials from .ccache file (KRB5CCNAME) based on target parameters. If valid credentials cannot be found, it will use the ones specified in the command line.
-
+  -k, --kerberos        Use Kerberos authentication. Grabs credentials from .ccache file (KRB5CCNAME) based on target parameters. If
+                        valid credentials cannot be found, it will use the ones specified in the command line.
 ```
 
-
-## Quick win commands
+## Quick start commands
 
  + Connect to a remote SMB server:
     ```
-    ./smbclient-ng.py -d "LAB" -u "Administrator" -p 'Admin123!' --host "10.0.0.201"
+    smbclient-ng -d "LAB" -u "Administrator" -p 'Admin123!' --host "10.0.0.201"
     ```
-
 
 ## Contributing
 
