@@ -4,10 +4,17 @@
 # Author             : Podalirius (@podalirius_)
 # Date created       : 20 may 2024
 
-
+from __future__ import annotations
 import ntpath
 import os
 import shlex
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Optional
+    from smbclientng.core.SMBSession import SMBSession
+    from smbclientng.core.Config import Config
+    from smbclientng.core.Logger import Logger
 
 
 class CommandCompleter(object):
@@ -27,6 +34,14 @@ class CommandCompleter(object):
     """
 
     commands = {
+        "acls": {
+            "description": [
+                "List ACLs of files and folders in cwd.", 
+                "Syntax: 'acls'"
+            ], 
+            "subcommands": [],
+            "autocomplete": ["remote_directory"]
+        },
         "bat": {
             "description": [
                 "Pretty prints the contents of a remote file.", 
@@ -96,7 +111,7 @@ class CommandCompleter(object):
                 "Search for files in a directory hierarchy",
                 "Syntax: find [-h] [-name NAME] [-iname INAME] [-type TYPE] [-size SIZE] [-ls]",
                 "             [-download] [-maxdepth MAXDEPTH] [-mindepth MINDEPTH]",
-                "             [PATH ...]"
+                "             [--exclude-dir DIRNAME[:DEPTH[:CASE]]] [PATH ...]"
             ],
             "subcommands": [],
             "autocomplete": []
@@ -104,7 +119,7 @@ class CommandCompleter(object):
         "get": {
             "description": [
                 "Get a remote file.",
-                "Syntax: 'get [-r] <directory or file>'"
+                "Syntax: 'get [-r] [-k] <directory or file>'"
             ], 
             "subcommands": [],
             "autocomplete": ["remote_file"]
@@ -334,8 +349,12 @@ class CommandCompleter(object):
             "autocomplete": ["share"]
         },
     }
+    
+    smbSession: SMBSession
+    config: Config
+    logger: Logger
 
-    def __init__(self, smbSession, config, logger):
+    def __init__(self, smbSession: SMBSession, config: Config, logger: Logger):
         # Objects
         self.smbSession = smbSession
         self.config = config
@@ -344,7 +363,7 @@ class CommandCompleter(object):
         self.commands["help"]["subcommands"] = ["format"] + list(self.commands.keys())
         self.commands["help"]["subcommands"].remove("help")
 
-    def complete(self, text, state):
+    def complete(self, text: str, state: int) -> str:
         """
         Function to handle command completion in the LDAP console.
 
@@ -497,7 +516,7 @@ class CommandCompleter(object):
         except IndexError:
             return None
 
-    def print_help(self, command=None):
+    def print_help(self, command: Optional[str] = None):
         """
         Prints help information for a specific command or all commands if no command is specified.
 

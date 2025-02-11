@@ -4,18 +4,30 @@
 # Author             : Podalirius (@podalirius_)
 # Date created       : 20 may 2024
 
-
+from __future__ import annotations
 import io
-import impacket.smbconnection
+from typing import Optional
+from impacket.smbconnection import SMBConnection, SessionError
+from impacket.dcerpc.v5 import transport, rpcrt, srvs
+from impacket.ldap import ldaptypes
+from impacket.nt_errors import STATUS_OBJECT_NAME_COLLISION
 import ntpath
 import os
 import random
 import re
 import sys
 import traceback
+import subprocess
 from smbclientng.core.LocalFileIO import LocalFileIO
-from smbclientng.core.utils import b_filesize, STYPE_MASK, is_port_open
+from smbclientng.core.utils import b_filesize, STYPE_MASK, is_port_open, smb_entry_iterator
+from smbclientng.core.SIDResolver import SIDResolver
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from smbclientng.core.Logger import Logger
+    from smbclientng.core.Config import Config
+    from smbclientng.core.Credentials import Credentials
+    from impacket.smb import SharedFile
 
 class SMBSession(object):
     """
@@ -52,7 +64,27 @@ class SMBSession(object):
         read_file(path): Reads a file from the SMB share.
         test_rights(sharename): Tests read and write access rights on a share.
     """
+    config: Config
+    logger: Logger
+    host: str
+    port: int
+    timeout: int
+    advertisedName: Optional[str]
 
+    # Credentials
+    credentials: Credentials
+
+    smbClient: Optional[SMBConnection] = None
+    connected: bool = False
+      
+    available_shares: dict[str,dict] = {}
+    smb_share: Optional[str] = None
+    smb_cwd: str = ""
+    smb_tree_id: Optional[int] = None
+
+    dce_srvsvc: Optional[rpcrt.DCERPC_v5] = None
+    sid_resolver: SIDResolver
+      
     def __init__(self, host, port, timeout, credentials, advertisedName=None, config=None, logger=None):
         super(SMBSession, self).__init__()
         # Objects
@@ -69,14 +101,6 @@ class SMBSession(object):
 
         # Credentials
         self.credentials = credentials
-
-        self.smbClient = None
-        self.connected = False
-
-        self.available_shares = {}
-        self.smb_share = None
-        self.smb_cwd = ""
-        self.smb_tree_id = None
 
         self.list_shares()
 
@@ -103,7 +127,7 @@ class SMBSession(object):
         else:
             raise Exception("SMB client is not initialized.")
 
-    def init_smb_session(self):
+    def init_smb_session(self) -> bool:
         """
         Initializes and establishes a session with the SMB server.
 
@@ -123,7 +147,7 @@ class SMBSession(object):
         try:
             result, error = is_port_open(self.host, self.port, self.timeout)
             if result:
-                self.smbClient = impacket.smbconnection.SMBConnection(
+                self.smbClient = SMBConnection(
                     remoteName=self.host,
                     remoteHost=self.host,
                     myName=self.advertisedName,
@@ -134,86 +158,99 @@ class SMBSession(object):
             else:
                 self.logger.error(f"Could not connect to '{self.host}:{self.port}', {error}.")
                 self.connected = False
-                self.smbClient = None
+                return False
         except OSError as err:
             if self.config.debug:
                 traceback.print_exc()
             self.logger.error("Could not connect to '%s:%d': %s" % (self.host, int(self.port), err))
             self.connected = False
-            self.smbClient = None
+            return False
 
-        if self.smbClient is not None:
-            if self.credentials.use_kerberos:
-                self.logger.debug("[>] Authenticating as '%s\\%s' with kerberos ... " % (self.credentials.domain, self.credentials.username))
+        if self.credentials.use_kerberos:
+            self.logger.debug("[>] Authenticating as '%s\\%s' with kerberos ... " % (self.credentials.domain, self.credentials.username))
+            try:
+                self.connected = self.smbClient.kerberosLogin(
+                    user=self.credentials.username,
+                    password=self.credentials.password,
+                    domain=self.credentials.domain,
+                    lmhash=self.credentials.lm_hex,
+                    nthash=self.credentials.nt_hex,
+                    aesKey=self.credentials.aesKey,
+                    kdcHost=self.credentials.kdcHost
+                )
+            except SessionError as err:
+                if self.config.debug:
+                    traceback.print_exc()
+                self.logger.error("Could not login: %s" % err)
+                self.connected = False
+
+        else:
+            if len(self.credentials.lm_hex) != 0 and len(self.credentials.nt_hex) != 0:
+                self.logger.debug("[>] Authenticating as '%s\\%s' with NTLM with pass the hash ... " % (self.credentials.domain, self.credentials.username))
                 try:
-                    self.connected = self.smbClient.kerberosLogin(
+                    self.logger.debug("  | user     = %s" % self.credentials.username)
+                    self.logger.debug("  | password = %s" % self.credentials.password)
+                    self.logger.debug("  | domain   = %s" % self.credentials.domain)
+                    self.logger.debug("  | lmhash   = %s" % self.credentials.lm_hex)
+                    self.logger.debug("  | nthash   = %s" % self.credentials.nt_hex)
+                    
+                    self.connected = self.smbClient.login(
                         user=self.credentials.username,
                         password=self.credentials.password,
                         domain=self.credentials.domain,
                         lmhash=self.credentials.lm_hex,
-                        nthash=self.credentials.nt_hex,
-                        aesKey=self.credentials.aesKey,
-                        kdcHost=self.credentials.kdcHost
+                        nthash=self.credentials.nt_hex
                     )
-                except impacket.smbconnection.SessionError as err:
+                except SessionError as err:
                     if self.config.debug:
                         traceback.print_exc()
                     self.logger.error("Could not login: %s" % err)
                     self.connected = False
 
             else:
-                if len(self.credentials.lm_hex) != 0 and len(self.credentials.nt_hex) != 0:
-                    self.logger.debug("[>] Authenticating as '%s\\%s' with NTLM with pass the hash ... " % (self.credentials.domain, self.credentials.username))
-                    try:
-                        self.logger.debug("  | user     = %s" % self.credentials.username)
-                        self.logger.debug("  | password = %s" % self.credentials.password)
-                        self.logger.debug("  | domain   = %s" % self.credentials.domain)
-                        self.logger.debug("  | lmhash   = %s" % self.credentials.lm_hex)
-                        self.logger.debug("  | nthash   = %s" % self.credentials.nt_hex)
-                        
-                        self.connected = self.smbClient.login(
-                            user=self.credentials.username,
-                            password=self.credentials.password,
-                            domain=self.credentials.domain,
-                            lmhash=self.credentials.lm_hex,
-                            nthash=self.credentials.nt_hex
-                        )
-                    except impacket.smbconnection.SessionError as err:
-                        if self.config.debug:
-                            traceback.print_exc()
-                        self.logger.error("Could not login: %s" % err)
-                        self.connected = False
+                self.logger.debug("[>] Authenticating as '%s\\%s' with NTLM with password ... " % (self.credentials.domain, self.credentials.username))
+                try:
+                    self.logger.debug("  | user     = %s" % self.credentials.username)
+                    self.logger.debug("  | password = %s" % self.credentials.password)
+                    self.logger.debug("  | domain   = %s" % self.credentials.domain)
+                    self.logger.debug("  | lmhash   = %s" % self.credentials.lm_hex)
+                    self.logger.debug("  | nthash   = %s" % self.credentials.nt_hex)
 
-                else:
-                    self.logger.debug("[>] Authenticating as '%s\\%s' with NTLM with password ... " % (self.credentials.domain, self.credentials.username))
-                    try:
-                        self.logger.debug("  | user     = %s" % self.credentials.username)
-                        self.logger.debug("  | password = %s" % self.credentials.password)
-                        self.logger.debug("  | domain   = %s" % self.credentials.domain)
-                        self.logger.debug("  | lmhash   = %s" % self.credentials.lm_hex)
-                        self.logger.debug("  | nthash   = %s" % self.credentials.nt_hex)
+                    self.connected = self.smbClient.login(
+                        user=self.credentials.username,
+                        password=self.credentials.password,
+                        domain=self.credentials.domain,
+                        lmhash=self.credentials.lm_hex,
+                        nthash=self.credentials.nt_hex
+                    )
+                except SessionError as err:
+                    if self.config.debug:
+                        traceback.print_exc()
+                    self.logger.error("Could not login: %s" % err)
+                    self.connected = False
 
-                        self.connected = self.smbClient.login(
-                            user=self.credentials.username,
-                            password=self.credentials.password,
-                            domain=self.credentials.domain,
-                            lmhash=self.credentials.lm_hex,
-                            nthash=self.credentials.nt_hex
-                        )
-                    except impacket.smbconnection.SessionError as err:
-                        if self.config.debug:
-                            traceback.print_exc()
-                        self.logger.error("Could not login: %s" % err)
-                        self.connected = False
+        if self.connected:
+            self.logger.print("[+] Successfully authenticated to '%s' as '%s\\%s'!" % (self.host, self.credentials.domain, self.credentials.username))
+        else:
+            self.logger.error("Failed to authenticate to '%s' as '%s\\%s'!" % (self.host, self.credentials.domain, self.credentials.username))
 
-            if self.connected:
-                self.logger.print("[+] Successfully authenticated to '%s' as '%s\\%s'!" % (self.host, self.credentials.domain, self.credentials.username))
-            else:
-                self.logger.error("Failed to authenticate to '%s' as '%s\\%s'!" % (self.host, self.credentials.domain, self.credentials.username))
+        if self.connected:
+            try:
+                self.sid_resolver = SIDResolver(self.smbClient)
+            except Exception as err:
+                self.logger.error(f"SIDResolver could not be initialized: {err}")
+            try:
+                rpctransport = transport.SMBTransport(self.smbClient.getRemoteName(), self.smbClient.getRemoteHost(), filename=r'\srvsvc',
+                                                    smb_connection=self.smbClient)
+                self.dce_srvsvc = rpctransport.get_dce_rpc()
+                self.dce_srvsvc.connect()
+                self.dce_srvsvc.bind(srvs.MSRPC_UUID_SRVS)
+            except Exception as err:
+                self.logger.error(f"Could not initialize connection to srvsvc: {err}")
 
         return self.connected
 
-    def ping_smb_session(self):
+    def ping_smb_session(self) -> bool:
         """
         Tests the connectivity to the SMB server by sending an echo command.
 
@@ -237,161 +274,147 @@ class SMBSession(object):
         return self.connected
 
     # Operations
-
-    def find(self, paths=[], callback=None, excluded_dirs=[], exclude_dir_depth=0):
+    def get_file(self, path: Optional[str] = None, keepRemotePath: bool = False, localDownloadDir: str ="./", is_recursive: bool = False):
         """
-        Finds files and directories on the SMB share based on the provided paths and executes a callback function on each entry.
-
-        This method traverses the specified paths on the SMB share, recursively exploring directories and invoking the callback
-        function on each file or directory found. The callback function is called with three arguments: the entry object, the
-        full path of the entry, and the current depth of recursion.
-
-        Args:
-            paths (list, optional): A list of paths to start the search from. Defaults to an empty list.
-            callback (function, optional): A function to be called on each entry found. The function should accept three arguments:
-                                           the entry object, the full path of the entry, and the current depth of recursion. Defaults to None.
-            excluded_dirs (list, optional): A list of directories to exclude from the search. Defaults to None.
-
-        Note:
-            If the callback function is None, the method will print an error message and return without performing any action.
-        """
-
-        def recurse_action(paths=[], depth=0, callback=None):
-            if callback is None:
-                return []
-            
-            next_directories_to_explore = []
-
-            for path in paths:
-                normalized_path = ntpath.normpath(path)
-                # Exclude paths that are in the exclude list based on depth
-                if exclude_dir_depth == -1 or depth == exclude_dir_depth:
-                    if any(excluded.lower() == ntpath.basename(normalized_path).lower() for excluded in excluded_dirs):
-                        continue  # Skip this path
-
-                remote_smb_path = ntpath.normpath(self.smb_cwd + ntpath.sep + path)
-                entries = []
-
-                try:
-                    entries = self.smbClient.listPath(
-                        shareName=self.smb_share,
-                        path=(remote_smb_path + ntpath.sep + '*')
-                    )
-                except impacket.smbconnection.SessionError as err:
-                    continue
-                # Remove dot names
-                entries = [e for e in entries if e.get_longname() not in [".", ".."]]
-                # Sort the entries ignoring case
-                entries = sorted(entries, key=lambda x: x.get_longname().lower())
-
-                for entry in entries:
-                    fullpath = ntpath.join(path, entry.get_longname())
-
-                    if entry.is_directory():
-                        # Exclude directories during traversal based on exclude_dir_depth
-                        if exclude_dir_depth == -1 or depth + 1 == exclude_dir_depth:
-                            if any(excluded.lower() == entry.get_longname().lower() for excluded in excluded_dirs):
-                                continue  # Skip this directory
-
-                        next_directories_to_explore.append(fullpath)
-
-                    # Process the entry
-                    fullpath = re.sub(r'\\\\+', r'\\', fullpath)
-                    callback(entry, fullpath, depth)
-
-            return next_directories_to_explore
-        
-        if callback is not None:
-            depth = 0
-            while len(paths) != 0:
-                paths = recurse_action(
-                    paths=paths,
-                    depth=depth,
-                    callback=callback
-                )
-                depth = depth + 1
-        else:
-            self.logger.error("SMBSession.find(), callback function cannot be None.")
-
-    def get_file(self, path=None, keepRemotePath=False, localDownloadDir="./"):
-        """
-        Retrieves a file from the specified path on the SMB share.
+        Retrieves files or directories from the specified path(s) on the SMB share.
 
         This method attempts to retrieve a file from the given path within the currently connected SMB share.
         If the path points to a directory, it skips the retrieval. It handles file retrieval by creating a local
         file object and writing the contents of the remote file to it using the SMB client's getFile method.
 
         Parameters:
-            path (str): The path of the file to retrieve. If None, uses the current smb_path.
+            path (str): The path of the file, directory, or pattern to retrieve.
+            keepRemotePath (bool): Whether to preserve the remote directory structure locally.
+            localDownloadDir (str): The local directory to download files into.
 
         Returns:
             None
         """
+        if path is None:
+            path = self.smb_cwd or ''
 
-        # Parse path
+        # Normalize and parse the path
         path = path.replace('/', ntpath.sep)
-        if ntpath.sep in path:
-            if path.startswith(ntpath.sep):
-                tmp_search_path = ntpath.normpath(ntpath.dirname(path))
-            else:
-                tmp_search_path = ntpath.normpath(self.smb_cwd + ntpath.sep + ntpath.dirname(path))
+        path = ntpath.normpath(path)
+
+        # Handle paths starting with './' or '.\'
+        if path.startswith('.' + ntpath.sep) or path.startswith('.' + os.path.sep):
+            # Remove the './' or '.\' prefix
+            path = path[2:]
+            path = ntpath.normpath(ntpath.join(self.smb_cwd or '', path))
+        elif not ntpath.isabs(path):
+            # Relative path
+            path = ntpath.normpath(ntpath.join(self.smb_cwd or '', path))
         else:
-            tmp_search_path = ntpath.normpath(self.smb_cwd + ntpath.sep)
-        # Parse filename
-        filename = ntpath.basename(path)
+            # Absolute path (remove leading backslash)
+            path = path.lstrip(ntpath.sep)
+            path = ntpath.normpath(path)
+            
+        if self.path_isdir(path):
+            # Handle directories
+            max_depth = None if is_recursive else 0
+            start_paths = [path]
 
-        # Search for the file
-        matches = self.smbClient.listPath(
-            shareName=self.smb_share, 
-            path=tmp_search_path + ntpath.sep + '*'
-        )   
+            generator = smb_entry_iterator(
+                smb_client=self.smbClient,
+                smb_share=self.smb_share,
+                start_paths=start_paths,
+                exclusion_rules=[],
+                max_depth=max_depth
+            )
 
-        # Filter the entries
-        matching_entries = []
-        for entry in matches:
-            if entry.is_directory():
-                # Skip directories
-                continue
-            if entry.get_longname() == filename:
-                matching_entries.append(entry)
-            elif '*' in filename:
-                regexp = filename.replace('.', '\\.').replace('*', '.*')
-                if re.match(regexp, entry.get_longname()):
-                    matching_entries.append(entry)
-        
-        matching_entries = sorted(list(set(matching_entries)), key=lambda x: x.get_longname())
-
-        for entry in matching_entries:
-            if entry.is_directory():
-                self.logger.debug("[>] Skipping '%s' because it is a directory." % (tmp_search_path + ntpath.sep + entry.get_longname()))
-            else:
+            entry_count = 0
+            fullpath = None
+            for entry, fullpath, depth, is_last_entry in generator:
+                entry_count += 1
                 try:
-                    if ntpath.sep in path:
-                        outputfile = localDownloadDir + os.path.sep + ntpath.dirname(path) + os.path.sep + entry.get_longname()
+                    if entry.is_directory():
+                        if keepRemotePath:
+                            base_path = './'  # Use root as base
+                            relative_path = ntpath.relpath(fullpath, base_path)
+                            relative_path = relative_path.replace(ntpath.sep, os.path.sep)
+                            output_path = os.path.normpath(os.path.join(localDownloadDir, relative_path))
+                            os.makedirs(output_path, exist_ok=True)
+                            self.logger.info(f"Created directory: {output_path}")
+                        else:
+                            # Do not create directories when keepRemotePath is False
+                            pass
                     else:
-                        outputfile = localDownloadDir + os.path.sep + entry.get_longname()
-                    f = LocalFileIO(
-                        mode="wb", 
-                        path=outputfile,
-                        expected_size=entry.get_filesize(), 
-                        logger=self.logger,
-                        keepRemotePath=keepRemotePath
-                    )
+                        if keepRemotePath:
+                            base_path = './' # Use root as base
+                            relative_path = ntpath.relpath(fullpath, base_path)
+                            relative_path = relative_path.replace(ntpath.sep, os.path.sep)
+                            output_path = os.path.normpath(os.path.join(localDownloadDir, relative_path))
+                        else:
+                            relative_path = ntpath.basename(fullpath)
+                            output_path = os.path.normpath(os.path.join(localDownloadDir, relative_path))
+
+                        # Ensure the parent directory exists
+                        output_dir = os.path.dirname(output_path)
+                        if output_dir and not os.path.exists(output_dir):
+                            os.makedirs(output_dir, exist_ok=True)
+
+                        self.download_file(fullpath, output_path, keepRemotePath)
+                except Exception as e:
+                    self.logger.error(f"Failed to process '{fullpath}': {e}")
+
+            self.logger.info(f"Total entries processed in the directory '{fullpath}': {entry_count}")
+        else:
+            # Handle files
+            try:
+                entry_name = ntpath.basename(path)
+                if not entry_name:
+                    self.logger.error(f"Cannot determine the file name from the path: '{path}'")
+                    return
+                if keepRemotePath:
+                    base_path = './' # Use root as base
+                    relative_path = ntpath.relpath(path, base_path)
+                    relative_path = relative_path.replace(ntpath.sep, os.path.sep)
+                    output_filepath = os.path.normpath(os.path.join(localDownloadDir, relative_path))
+                else:
+                    relative_path = entry_name
+                    output_filepath = os.path.normpath(os.path.join(localDownloadDir, relative_path))
+
+                # Ensure the parent directory exists
+                output_dir = os.path.dirname(output_filepath)
+                if output_dir and not os.path.exists(output_dir):
+                    os.makedirs(output_dir, exist_ok=True)
+
+                self.download_file(path, output_filepath, keepRemotePath)
+            except Exception as e:
+                self.logger.error(f"Failed to download '{path}': {e}")
+
+
+    def download_file(self, full_path: str, outputfile: str, keepRemotePath: bool):
+        """Downloads a single file."""
+        try:
+            # Get the file entry
+            entries = self.smbClient.listPath(self.smb_share, full_path)
+            # Ensure no directory will be processed
+            entries = [e for e in entries if e.get_longname() not in ['.', '..']]
+            if len(entries) == 1 and not entries[0].is_directory():
+                entry = entries[0]
+                # Download the file
+                f = LocalFileIO(
+                    mode="wb",
+                    path=outputfile,
+                    logger=self.logger,
+                    expected_size=entry.get_filesize(),
+                    keepRemotePath=keepRemotePath,
+                )
+                try:
                     self.smbClient.getFile(
-                        shareName=self.smb_share, 
-                        pathName=tmp_search_path + ntpath.sep + entry.get_longname(), 
+                        shareName=self.smb_share,
+                        pathName=full_path,
                         callback=f.write
                     )
+                finally:
                     f.close()
-                except (BrokenPipeError, KeyboardInterrupt) as e:
-                    f.close()
-                    print("\x1b[v\x1b[o\r[!] Interrupted.")
-                    self.close_smb_session()
-                    self.init_smb_session()
-                        
-        return None
+        except Exception as e:
+            self.logger.error(f"Failed to download '{full_path}': {e}")
 
-    def get_file_recursively(self, path=None, localDownloadDir="./"):
+
+    def get_file_recursively(self, path: Optional[str] = None, localDownloadDir: str = "./"):
         """
         Recursively retrieves files from a specified path on the SMB share.
 
@@ -431,9 +454,9 @@ class SMBSession(object):
                         f = LocalFileIO(
                             mode="wb",
                             path=downloadToPath, 
+                            logger=self.logger,
                             expected_size=entry_file.get_filesize(),
                             keepRemotePath=True,
-                            logger=self.logger
                         )
                         try:
                             self.smbClient.getFile(
@@ -456,7 +479,9 @@ class SMBSession(object):
                             base_dir=self.smb_cwd,
                             path=path+[entry_directory.get_longname()],
                             localDownloadDir=localDownloadDir
-                        )                   
+                        )
+        if path is None:
+            path = self.smb_cwd or ''
         # Entrypoint
         try:
             if path.startswith(ntpath.sep):
@@ -471,12 +496,12 @@ class SMBSession(object):
                 path=[path],
                 localDownloadDir=localDownloadDir
             )
-        except (BrokenPipeError, KeyboardInterrupt) as e:
+        except (BrokenPipeError, KeyboardInterrupt):
             print("\x1b[v\x1b[o\r[!] Interrupted.")
             self.close_smb_session()
             self.init_smb_session()
 
-    def get_entry(self, path=None):
+    def get_entry(self, path: Optional[str] = None) -> Optional[SharedFile]:
         """
         Retrieves information about a specific entry located at the provided path on the SMB share.
 
@@ -502,7 +527,7 @@ class SMBSession(object):
         else:
             return None 
 
-    def info(self, share=True, server=True):
+    def info(self, share: bool = True, server: bool = True):
         """
         Displays information about the server and optionally the shares.
 
@@ -559,11 +584,11 @@ class SMBSession(object):
                 self.logger.print("  └─")
 
         if share and self.smb_share is not None:
-            share_name = self.available_shares.get(self.smb_share.lower(), "")["name"]
-            share_comment = self.available_shares.get(self.smb_share.lower(), "")["comment"]
-            share_type = self.available_shares.get(self.smb_share.lower(), "")["type"]
+            share_name = self.available_shares.get(self.smb_share.lower(), {"name": ""})["name"]
+            share_comment = self.available_shares.get(self.smb_share.lower(), {"comment": ""})["comment"]
+            share_type = self.available_shares.get(self.smb_share.lower(), {"type": ""})["type"]
             share_type =', '.join([s.replace("STYPE_","") for s in share_type])
-            share_rawtype = self.available_shares.get(self.smb_share.lower(), "")["rawtype"]
+            share_rawtype = self.available_shares.get(self.smb_share.lower(), {"rawtype": ""})["rawtype"]
             if self.config.no_colors:
                 self.logger.print("\n[+] Share:")
                 self.logger.print("  ├─ Name ──────────── : %s" % (share_name))
@@ -577,7 +602,7 @@ class SMBSession(object):
                 self.logger.print("  ├─ \x1b[94mType\x1b[0m \x1b[90m────────────\x1b[0m : \x1b[93m%s\x1b[0m" % (share_type))
                 self.logger.print("  └─ \x1b[94mRaw type value\x1b[0m \x1b[90m──\x1b[0m : \x1b[93m%s\x1b[0m" % (share_rawtype))
 
-    def list_contents(self, path=None):
+    def list_contents(self, path: Optional[str] = None) -> dict[str, SharedFile]:
         """
         Lists the contents of a specified directory on the SMB share.
 
@@ -608,8 +633,87 @@ class SMBSession(object):
             contents[entry.get_longname()] = entry
 
         return contents
+    
+    def printSecurityDescriptorTable(self, security_descriptor: str, subject: str, prefix: str = " "*13, table_colors: bool = False):
+        self.logger.print(self.securityDescriptorTable(security_descriptor, subject, prefix, table_colors))
 
-    def list_shares(self):
+    def securityDescriptorTable(self, security_descriptor: str, subject: str, prefix: str = " "*13, table_colors: bool = False) -> str:
+        if security_descriptor is not None and len(security_descriptor) == 0:
+            return ""
+        out_sd = ""
+        sd = ldaptypes.SR_SECURITY_DESCRIPTOR()
+        sd.fromString(security_descriptor)
+        try:
+            self.sid_resolver.resolve_sids(set(
+                ([sd['OwnerSid'].formatCanonical()] if len(sd['OwnerSid']) != 0 else []) 
+                + ([sd['GroupSid'].formatCanonical()] if len(sd['GroupSid']) != 0 else []) 
+                + [acl['Ace']['Sid'].formatCanonical() for acl in sd['Dacl']['Data'] if len(acl['Ace']['Sid']) != 0]))
+        except Exception as err:
+            self.logger.debug(f"Could not resolve SID for {subject}: {str(err)}")
+            traceback.print_exc()
+        max_resolved_sid_length = max([len(i) for i in self.sid_resolver.cache.values()] + [0])
+
+        if len(sd['OwnerSid']) != 0:
+            resolved_owner_sid = self.sid_resolver.get_sid(sd['OwnerSid'].formatCanonical())
+            resolved_group_sid = self.sid_resolver.get_sid(sd['GroupSid'].formatCanonical())
+
+            if self.config.no_colors:
+                out_sd += f"{prefix}Owner:   {resolved_owner_sid}\n"
+                out_sd += f"{prefix}Group:   {resolved_group_sid}"
+            else:
+                if table_colors:
+                    out_sd += f"{prefix}Owner:   [bold yellow]{resolved_owner_sid}[/bold yellow]\n"
+                    out_sd += f"{prefix}Group:   [bold yellow]{resolved_group_sid}[/bold yellow]"
+                else:
+                    out_sd += f"{prefix}Owner:   \x1b[1m{resolved_owner_sid}\x1b[0m\n"
+                    out_sd += f"{prefix}Group:   \x1b[1m{resolved_group_sid}\x1b[0m"
+        
+        for i, acl in enumerate(sd['Dacl']['Data']):
+            resolved_sid = acl['Ace']['Sid'].formatCanonical() if len(acl['Ace']['Sid']) != 0 else ""
+            if resolved_sid in ["S-1-5-32-544", "S-1-5-18"]:
+                continue
+            
+            flags = []
+            for flag in ["GENERIC_READ", "GENERIC_WRITE", "GENERIC_EXECUTE", "GENERIC_ALL", "MAXIMUM_ALLOWED", "ACCESS_SYSTEM_SECURITY", "WRITE_OWNER", "WRITE_DACL", "DELETE", "READ_CONTROL", "SYNCHRONIZE"]:
+                if len(acl['Ace']['Mask']) != 0 and acl['Ace']['Mask'].hasPriv(getattr(ldaptypes.ACCESS_MASK, flag)):
+                    flags.append(flag)
+            if len(flags) == 0:
+                continue
+            try:
+                resolved_sid = self.sid_resolver.get_sid(resolved_sid) if resolved_sid else ""
+            except Exception as err:
+                self.logger.debug(f"Could not resolve SID {resolved_sid} for {subject}: {str(err)}")
+
+            acl_string = prefix
+            inbetween = ""
+            if len(resolved_sid) < max_resolved_sid_length+1:
+                inbetween = " "*(max_resolved_sid_length+1-len(resolved_sid))
+            
+            if self.config.no_colors:
+                acl_string += f"{resolved_sid}" + ' | '.join(flags)
+            else:
+                acl_string += "Allowed: " if acl['TypeName'] == "ACCESS_ALLOWED_ACE" else "Denied:  "
+                if table_colors:
+                    acl_string += f"[bold yellow]{resolved_sid}[/bold yellow]"
+                else:
+                    acl_string += f"\x1b[1m{resolved_sid}\x1b[0m"
+                acl_string += inbetween
+                acl_string += ' | '.join(flags)
+            out_sd += "\n" + acl_string
+        return out_sd.lstrip("\n")
+
+    def listSharesDetailed(self) -> dict:
+        """
+        get a list of available shares at the connected target
+
+        :return: a list containing dict entries for each share
+        :raise SessionError: if error
+        """
+        # Get the shares through RPC
+        resp = srvs.hNetrShareEnum(self.dce_srvsvc, 502, serverName="\\\\" + self.smbClient.getRemoteHost())
+        return resp['InfoStruct']['ShareInfo']['Level502']['Buffer']
+
+    def list_shares(self) -> dict[str,dict]:
         """
         Lists all the shares available on the connected SMB server.
 
@@ -625,27 +729,47 @@ class SMBSession(object):
 
         if self.connected:
             if self.smbClient is not None:
-                resp = self.smbClient.listShares()
+                try:
+                    resp = self.listSharesDetailed()
+                    for share in resp:
+                        # SHARE_INFO_502 structure (lmshare.h)
+                        # https://learn.microsoft.com/en-us/windows/win32/api/lmshare/ns-lmshare-share_info_502
+                        sharename = share["shi502_netname"][:-1]
+                        sharecomment = share["shi502_remark"][:-1]
+                        sharetype = share["shi502_type"]
+                        sharesd = share["shi502_security_descriptor"]
 
-                for share in resp:
-                    # SHARE_INFO_1 structure (lmshare.h)
-                    # https://learn.microsoft.com/en-us/windows/win32/api/lmshare/ns-lmshare-share_info_1
-                    sharename = share["shi1_netname"][:-1]
-                    sharecomment = share["shi1_remark"][:-1]
-                    sharetype = share["shi1_type"]
+                        self.available_shares[sharename.lower()] = {
+                            "name": sharename,
+                            "type": STYPE_MASK(sharetype),
+                            "rawtype": sharetype,
+                            "comment": sharecomment,
+                            "security_descriptor": sharesd
+                        }
+                except Exception as err:
+                    self.logger.debug(f"Could not get detailed share info: {str(err)}")
+                    resp = self.smbClient.listShares()
 
-                    self.available_shares[sharename.lower()] = {
-                        "name": sharename, 
-                        "type": STYPE_MASK(sharetype), 
-                        "rawtype": sharetype, 
-                        "comment": sharecomment
-                    }
+                    for share in resp:
+                        # SHARE_INFO_1 structure (lmshare.h)
+                        # https://learn.microsoft.com/en-us/windows/win32/api/lmshare/ns-lmshare-share_info_1
+                        sharename = share["shi1_netname"][:-1]
+                        sharecomment = share["shi1_remark"][:-1]
+                        sharetype = share["shi1_type"]
+
+                        self.available_shares[sharename.lower()] = {
+                            "name": sharename,
+                            "type": STYPE_MASK(sharetype),
+                            "rawtype": sharetype,
+                            "comment": sharecomment
+                        }
+
             else:
                 self.logger.error("Error: SMBSession.smbClient is None.")
 
         return self.available_shares
 
-    def mkdir(self, path=None):
+    def mkdir(self, path: str):
         """
         Creates a directory at the specified path on the SMB share.
 
@@ -654,42 +778,38 @@ class SMBSession(object):
         the creation for that directory without raising an error.
 
         Args:
-            path (str, optional): The full path of the directory to create on the SMB share. Defaults to None.
+            path (str): The full path of the directory to create on the SMB share. Defaults to None.
 
         Note:
             The path should use forward slashes ('/') which will be converted to backslashes (ntpath.sep) for SMB compatibility.
         """
 
-        if path is not None:
-            # Prepare path
-            path = path.replace('/',ntpath.sep)
-            if ntpath.sep in path:
-                path = path.strip(ntpath.sep).split(ntpath.sep)
-            else:
-                path = [path]
-
-            # Create each dir in the path
-            for depth in range(1, len(path)+1):
-                tmp_path = ntpath.sep.join(path[:depth])
-                try:
-                    self.smbClient.createDirectory(
-                        shareName=self.smb_share, 
-                        pathName=ntpath.normpath(self.smb_cwd + ntpath.sep + tmp_path + ntpath.sep)
-                    )
-                except impacket.smbconnection.SessionError as err:
-                    if err.getErrorCode() == 0xc0000035:
-                        # STATUS_OBJECT_NAME_COLLISION
-                        # Remote directory already created, this is normal
-                        # Src: https://github.com/fortra/impacket/blob/269ce69872f0e8f2188a80addb0c39fedfa6dcb8/impacket/nt_errors.py#L268C9-L268C19
-                        pass
-                    else:
-                        self.logger.error("Failed to create directory '%s': %s" % (tmp_path, err))
-                        if self.config.debug:
-                            traceback.print_exc()
+        # Prepare path
+        split_path = path.replace('/',ntpath.sep)
+        if ntpath.sep in path:
+            split_path = path.strip(ntpath.sep).split(ntpath.sep)
         else:
-            pass
+            split_path = [split_path]
 
-    def mount(self, local_mount_point, remote_path):
+        # Create each dir in the path
+        for depth in range(1, len(split_path)+1):
+            tmp_path = ntpath.sep.join(split_path[:depth])
+            try:
+                self.smbClient.createDirectory(
+                    shareName=self.smb_share, 
+                    pathName=ntpath.normpath(self.smb_cwd + ntpath.sep + tmp_path + ntpath.sep)
+                )
+            except SessionError as err:
+                if err.getErrorCode() == STATUS_OBJECT_NAME_COLLISION:
+                    # Remote directory already created, this is normal
+                    # Src: https://github.com/fortra/impacket/blob/269ce69872f0e8f2188a80addb0c39fedfa6dcb8/impacket/nt_errors.py#L268C9-L268C19
+                    pass
+                else:
+                    self.logger.error("Failed to create directory '%s': %s" % (tmp_path, err))
+                    if self.config.debug:
+                        traceback.print_exc()
+
+    def mount(self, local_mount_point: str, remote_path: str):
         """
         Generates the command to mount an SMB share on different platforms.
 
@@ -710,31 +830,65 @@ class SMBSession(object):
             None
         """
 
+        executable = None
+        args = None
+
         if not os.path.exists(local_mount_point):
             pass
 
-        if sys.platform.startswith('win'):
-            remote_path = remote_path.replace('/',ntpath.sep)
-            command = f"net use {local_mount_point} \\\\{self.host}\\{self.smb_share}\\{remote_path}"
+        if sys.platform.startswith("win"):
+            remote_path = remote_path.replace('/', ntpath.sep)
+
+            executable = "net"
+            args = [
+                "use",
+                f"{local_mount_point}", 
+                f"\\\\{self.host}\\{self.smb_share}\\{remote_path}",
+            ]   
         
-        elif sys.platform.startswith('linux'):
-            remote_path = remote_path.replace(ntpath.sep,'/')
-            command = f"mount -t cifs //{self.host}/{self.smb_share}/{remote_path} {local_mount_point} -o username={self.credentials.username},password={self.credentials.password}"
+        elif sys.platform.startswith("linux"):
+            remote_path = remote_path.replace(ntpath.sep, '/')
+            password = self.credentials.password.replace('"', '\\"')
+
+            executable = "mount"
+            args = [
+                "-t",
+                "cifs",
+                f"//{self.host}/{self.smb_share}/{remote_path}",
+                f"{local_mount_point}",
+                "-o",
+                f"username={self.credentials.username},password={password}"
+            ]
         
-        elif sys.platform.startswith('darwin'):
-            remote_path = remote_path.replace(ntpath.sep,'/')
-            command = f"mount_smbfs //{self.credentials.username}:{self.credentials.password}@{self.host}/{self.smb_share}/{remote_path} {local_mount_point}"
+        elif sys.platform.startswith("darwin"):
+            remote_path = remote_path.replace(ntpath.sep, '/')
+            password = self.credentials.password.replace('"', '\\"')
+            
+            executable = "mount_smbfs"
+            args = [
+                f"//{self.credentials.username}:{self.credentials.password}@{self.host}/{self.smb_share}/{remote_path}",
+                f"{local_mount_point}",
+            ]
         
         else:
-            command = None
+            executable = None
+            args = None
             self.logger.error("Unsupported platform for mounting SMB share.")
         
-        if command is not None:
+        if executable is not None:
             if self.config.debug:
-                self.logger.debug("Executing: %s" % command)
-            os.system(command)
+                self.logger.debug("Executing '%s' with arguments: %s" % (executable, args))
+            process = subprocess.Popen(executable=executable, args=args, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = process.communicate()
+            if process.returncode != 0:
+                self.logger.error("Command failed with error: %s" % stderr.decode())
+            else:
+                output = stdout.decode()
+                if len(output) != 0:
+                    self.logger.debug("Command output: %s" % stdout.decode())
+                self.logger.info(f"Successfully mounted '\\\\{self.host}\\{self.smb_share}\\{remote_path}' to local '{local_mount_point}'.")
 
-    def path_exists(self, path=None):
+    def path_exists(self, path: Optional[str] = None):
         """
         Checks if the specified path exists on the SMB share.
 
@@ -762,7 +916,7 @@ class SMBSession(object):
         else:
             return False
    
-    def path_isdir(self, pathFromRoot=None):
+    def path_isdir(self, pathFromRoot: Optional[str] = None):
         """
         Checks if the specified path is a directory on the SMB share.
 
@@ -805,7 +959,7 @@ class SMBSession(object):
         else:
             return False
 
-    def path_isfile(self, pathFromRoot=None):
+    def path_isfile(self, pathFromRoot: Optional[str] = None):
         """
         Checks if the specified path is a file on the SMB share.
 
@@ -844,7 +998,7 @@ class SMBSession(object):
         else:
             return False
 
-    def put_file(self, localpath=None):
+    def put_file(self, localpath: str):
         """
         Uploads a single file to the SMB share.
 
@@ -920,7 +1074,7 @@ class SMBSession(object):
                 # [!] The specified localpath does not exist.
                 pass
 
-    def put_file_recursively(self, localpath=None):
+    def put_file_recursively(self, localpath: Optional[str] = None):
         """
         Recursively uploads files from a specified local directory to the SMB share.
 
@@ -932,6 +1086,9 @@ class SMBSession(object):
         Args:
             localpath (str, optional): The local directory path from which files will be uploaded. Defaults to None.
         """
+
+        if localpath is None:
+            localpath = "./"
 
         if os.path.exists(localpath):
             if os.path.isdir(localpath):
@@ -956,7 +1113,7 @@ class SMBSession(object):
                             f = LocalFileIO(
                                 mode="rb", 
                                 path=local_dir_path + os.path.sep + local_file_path, 
-                                debug=self.config.debug
+                                logger=self.logger
                             )
                             self.smbClient.putFile(
                                 shareName=self.smb_share, 
@@ -980,7 +1137,7 @@ class SMBSession(object):
         else:
             self.logger.error("The specified localpath does not exist.")
 
-    def read_file(self, path=None):
+    def read_file(self, path: Optional[str] = None):
         """
         Reads a file from the SMB share.
 
@@ -1010,7 +1167,7 @@ class SMBSession(object):
                 # opening the files in streams instead of mounting shares allows 
                 # for running the script from unprivileged containers
                 self.smbClient.getFile(self.smb_share, tmp_file_path, fh.write)
-            except impacket.smbconnection.SessionError as e:
+            except SessionError as e:
                 return None
             rawdata = fh.getvalue()
             fh.close()
@@ -1018,7 +1175,7 @@ class SMBSession(object):
         else:
             return None
 
-    def rmdir(self, path=None):
+    def rmdir(self, path: str):
         """
         Removes a directory from the SMB share at the specified path.
 
@@ -1027,8 +1184,9 @@ class SMBSession(object):
         the stack trace of the exception.
 
         Args:
-            path (str, optional): The path of the directory to be removed on the SMB share. Defaults to None.
+            path (str): The path of the directory to be removed on the SMB share. Defaults to None.
         """
+
         try:
             self.smbClient.deleteDirectory(
                 shareName=self.smb_share, 
@@ -1039,7 +1197,7 @@ class SMBSession(object):
             if self.config.debug:
                 traceback.print_exc()
 
-    def rm(self, path=None):
+    def rm(self, path: str):
         """
         Removes a file from the SMB share at the specified path.
 
@@ -1048,7 +1206,7 @@ class SMBSession(object):
         the stack trace of the exception.
 
         Args:
-            path (str, optional): The path of the file to be removed on the SMB share. Defaults to None.
+            path (str): The path of the file to be removed on the SMB share. Defaults to None.
         """
 
         # Parse path
@@ -1092,7 +1250,7 @@ class SMBSession(object):
                 if self.config.debug:
                     traceback.print_exc()
 
-    def tree(self, path=None, quiet=False, outputfile=None):
+    def tree(self, path: Optional[str] = None, quiet: bool = False, outputfile: Optional[str] = None):
         """
         Recursively lists the directory structure of the SMB share starting from the specified path.
 
@@ -1104,165 +1262,87 @@ class SMBSession(object):
             path (str, optional): The starting path on the SMB share from which to begin listing the tree.
                                   Defaults to the root of the current share.
         """
-        
-        def recurse_action(base_dir="", path=[], prompt=[], quiet=False, outputfile=None):
-            bars = ["│   ", "├── ", "└── "]
+        if path is None:
+            path = self.smb_cwd or ''
 
-            remote_smb_path = ntpath.normpath(base_dir + ntpath.sep + ntpath.sep.join(path))
+        # Normalize and parse the path
+        path = path.replace('/', ntpath.sep)
+        path = ntpath.normpath(path)
+        path = path.strip(ntpath.sep)
 
-            entries = []
-            try:
-                entries = self.smbClient.listPath(
-                    shareName=self.smb_share, 
-                    path=remote_smb_path+'\\*'
-                )
-            except impacket.smbconnection.SessionError as err:
-                code, const, text = err.getErrorCode(), err.getErrorString()[0], err.getErrorString()[1]
-                errmsg = "Error 0x%08x (%s): %s" % (code, const, text)
-                if not quiet:
-                    if self.config.no_colors:
-                        self.logger.print("%s%s" % (''.join(prompt+[bars[2]]), errmsg))
-                    else:
-                        self.logger.print("%s\x1b[1;91m%s\x1b[0m" % (''.join(prompt+[bars[2]]), errmsg))
-                if outputfile is not None:
-                    with open(outputfile, 'a') as f:
-                        f.write("%s%s\n" % (''.join(prompt+[bars[2]]), errmsg))
-                return 
+        # Handle relative and absolute paths
+        if not ntpath.isabs(path):
+            path = ntpath.normpath(ntpath.join(self.smb_cwd or '', path))
+        else:
+            path = path.lstrip(ntpath.sep)
+            path = ntpath.normpath(path)
 
-            entries = [e for e in entries if e.get_longname() not in [".", ".."]]
-            entries = sorted(entries, key=lambda x:x.get_longname())
-
-            # 
-            if len(entries) > 1:
-                index = 0
-                for entry in entries:
-                    index += 1
-                    # This is the first entry 
-                    if index == 0:
-                        if entry.is_directory():
-                            if not quiet:
-                                if self.config.no_colors:
-                                    self.logger.print("%s%s\\" % (''.join(prompt+[bars[1]]), entry.get_longname()))
-                                else:
-                                    self.logger.print("%s\x1b[1;96m%s\x1b[0m\\" % (''.join(prompt+[bars[1]]), entry.get_longname()))
-                            if outputfile is not None:
-                                with open(outputfile, 'a') as f:
-                                    f.write("%s%s\\\n" % (''.join(prompt+[bars[1]]), entry.get_longname()))
-
-                            recurse_action(
-                                base_dir=base_dir, 
-                                path=path+[entry.get_longname()],
-                                prompt=prompt+["│   "]
-                            )
-                        else:
-                            if not quiet:
-                                if self.config.no_colors:
-                                    self.logger.print("%s%s" % (''.join(prompt+[bars[1]]), entry.get_longname()))
-                                else:
-                                    self.logger.print("%s\x1b[1m%s\x1b[0m" % (''.join(prompt+[bars[1]]), entry.get_longname()))
-                            if outputfile is not None:
-                                with open(outputfile, 'a') as f:
-                                    f.write("%s%s\n" % (''.join(prompt+[bars[1]]), entry.get_longname()))
-                    # This is the last entry
-                    elif index == len(entries):
-                        if entry.is_directory():
-                            if not quiet:
-                                if self.config.no_colors:
-                                    self.logger.print()
-                                else:
-                                    self.logger.print("%s\x1b[1;96m%s\x1b[0m\\" % (''.join(prompt+[bars[2]]), entry.get_longname()))
-                            if outputfile is not None:
-                                with open(outputfile, 'a') as f:
-                                    f.write("%s%s\\\n" % (''.join(prompt+[bars[2]]), entry.get_longname()))
-                            recurse_action(
-                                base_dir=base_dir, 
-                                path=path+[entry.get_longname()],
-                                prompt=prompt+["    "]
-                            )
-                        else:
-                            if not quiet:
-                                if self.config.no_colors:
-                                    self.logger.print("%s%s" % (''.join(prompt+[bars[2]]), entry.get_longname()))
-                                else:
-                                    self.logger.print("%s\x1b[1m%s\x1b[0m" % (''.join(prompt+[bars[2]]), entry.get_longname()))
-                            if outputfile is not None:
-                                with open(outputfile, 'a') as f:
-                                    f.write("%s%s\n" % (''.join(prompt+[bars[2]]), entry.get_longname()))
-                    # These are entries in the middle
-                    else:
-                        if entry.is_directory():
-                            if not quiet:
-                                if self.config.no_colors:
-                                    self.logger.print("%s%s\\" % (''.join(prompt+[bars[1]]), entry.get_longname()))
-                                else:
-                                    self.logger.print("%s\x1b[1;96m%s\x1b[0m\\" % (''.join(prompt+[bars[1]]), entry.get_longname()))
-                            if outputfile is not None:
-                                with open(outputfile, 'a') as f:
-                                    f.write("%s%s\\\n" % (''.join(prompt+[bars[1]]), entry.get_longname()))
-                            recurse_action(
-                                base_dir=base_dir, 
-                                path=path+[entry.get_longname()],
-                                prompt=prompt+["│   "]
-                            )
-                        else:
-                            if not quiet:
-                                if self.config.no_colors:
-                                    self.logger.print("%s%s" % (''.join(prompt+[bars[1]]), entry.get_longname()))
-                                else:
-                                    self.logger.print("%s\x1b[1m%s\x1b[0m" % (''.join(prompt+[bars[1]]), entry.get_longname()))
-                            if outputfile is not None:
-                                with open(outputfile, 'a') as f:
-                                    f.write("%s%s\n" % (''.join(prompt+[bars[1]]), entry.get_longname()))
-            # 
-            elif len(entries) == 1:
-                entry = entries[0]
-                if entry.is_directory():
-                    if not quiet:
-                        if self.config.no_colors:
-                            self.logger.print("%s%s\\" % (''.join(prompt+[bars[2]]), entry.get_longname()))
-                        else:
-                            self.logger.print("%s\x1b[1;96m%s\x1b[0m\\" % (''.join(prompt+[bars[2]]), entry.get_longname()))
-                    if outputfile is not None:
-                        with open(outputfile, 'a') as f:
-                            f.write("%s%s\\\n" % (''.join(prompt+[bars[2]]), entry.get_longname()))
-                    recurse_action(
-                        base_dir=base_dir, 
-                        path=path+[entry.get_longname()],
-                        prompt=prompt+["    "]
-                    )
-                else:
-                    if not quiet:
-                        if self.config.no_colors:
-                            self.logger.print("%s%s" % (''.join(prompt+[bars[2]]), entry.get_longname()))
-                        else:
-                            self.logger.print("%s\x1b[1m%s\x1b[0m" % (''.join(prompt+[bars[2]]), entry.get_longname()))
-                    if outputfile is not None:
-                        with open(outputfile, 'a') as f:
-                            f.write("%s%s\n" % (''.join(prompt+[bars[2]]), entry.get_longname()))
-        # Entrypoint
+        # Prepare output file
         if outputfile is not None:
-            if not os.path.exists(os.path.dirname(outputfile)):
-                os.makedirs(os.path.dirname(outputfile))
+            os.makedirs(os.path.dirname(outputfile), exist_ok=True)
             open(outputfile, 'w').close()
 
+        # Initialize variables
+        prefix_stack = []
+        prev_is_last = False
+
         try:
-            if self.config.no_colors:
-                self.logger.print("%s\\" % path)
-            else:
-                self.logger.print("\x1b[1;96m%s\x1b[0m\\" % path)
-            recurse_action(
-                base_dir=self.smb_cwd, 
-                path=[path],
-                prompt=[""],
-                quiet=quiet,
-                outputfile=outputfile
+            # Initialize the generator
+            generator = smb_entry_iterator(
+                smb_client=self.smbClient,
+                smb_share=self.smb_share,
+                start_paths=[path],
+                exclusion_rules=[],
+                max_depth=None
             )
-        except (BrokenPipeError, KeyboardInterrupt) as e:
+
+            last_depth = -1
+            for entry, fullpath, depth, is_last_entry in generator:
+                # Adjust the prefix stack based on the current depth
+                if depth > last_depth:
+                    if last_depth >= 0:
+                        prefix_stack.append('│   ' if not prev_is_last else '    ')
+                elif depth < last_depth:
+                    prefix_stack = prefix_stack[:depth]
+
+                # Determine the connector
+                connector = '└── ' if is_last_entry else '├── '
+
+                # Build the prefix
+                prefix = ''.join(prefix_stack)
+
+                # Format the entry name
+                entry_name = entry.get_longname()
+                if entry.is_directory():
+                    if not self.config.no_colors:
+                        entry_display = f"\x1b[1;96m{entry_name}\x1b[0m/"
+                    else:
+                        entry_display = f"{entry_name}/"
+                else:
+                    entry_display = entry_name
+
+                line = f"{prefix}{connector}{entry_display}"
+
+                # Output
+                if not quiet:
+                    self.logger.print(line)
+
+                if outputfile is not None:
+                    with open(outputfile, 'a') as f:
+                        f.write(f"{line}\n")
+
+                # Update variables for next iteration
+                last_depth = depth
+                prev_is_last = is_last_entry
+
+        except (BrokenPipeError, KeyboardInterrupt):
             self.logger.error("Interrupted.")
             self.close_smb_session()
             self.init_smb_session()
+        except Exception as e:
+            self.logger.error(f"Error during tree traversal: {e}")
 
-    def umount(self, local_mount_point):
+    def umount(self, local_mount_point: str):
         """
         Unmounts the specified local mount point of the remote share.
 
@@ -1278,24 +1358,40 @@ class SMBSession(object):
 
         if os.path.exists(local_mount_point):
             if sys.platform.startswith('win'):
-                command = f"net use {local_mount_point} /delete"
+                executable = "net"
+                args = [
+                    "use",
+                    f"{local_mount_point}",
+                    "/delete"
+                ]
 
             elif sys.platform.startswith('linux') or sys.platform.startswith('darwin'):
-                command = f"umount {local_mount_point}"
+                executable = "umount"
+                args = [f"{local_mount_point}"]
 
             else:
-                command = None
+                executable = None
+                args = None
                 self.logger.error("Unsupported platform for unmounting SMB share.")
         
-            if command is not None:
-                self.logger.debug("Executing: %s" % command)
-                os.system(command)
+            if executable is not None:
+                if self.config.debug:
+                    self.logger.debug("Executing '%s' with arguments: %s" % (executable, args))
+                process = subprocess.Popen(executable=executable, args=args, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                stdout, stderr = process.communicate()
+                if process.returncode != 0:
+                    self.logger.error("Command failed with error: %s" % stderr.decode())
+                else:
+                    output = stdout.decode()
+                    if len(output) != 0:
+                        self.logger.debug("Command output: %s" % stdout.decode())
+                    self.logger.info(f"Successfully unmounted local path '{local_mount_point}'.")
         else:
             self.logger.error("Cannot unmount a non existing path.")        
 
     # Other functions
 
-    def test_rights(self, sharename, test_write=False): 
+    def test_rights(self, sharename: str, test_write: bool = False): 
         """
         Tests the read and write access rights of the current SMB session.
 
@@ -1309,7 +1405,13 @@ class SMBSession(object):
 
         # Restore the current share
         current_share = self.smb_share
-        self.set_share(shareName=sharename)
+        current_cwd = self.smb_cwd
+        try:
+            self.set_share(shareName=sharename)
+        except:
+            self.set_share(shareName=current_share)
+            self.smb_cwd = current_cwd
+            return {"readable": False, "writable": False}
 
         access_rights = {"readable": False, "writable": False}
 
@@ -1317,7 +1419,7 @@ class SMBSession(object):
         try:
             self.smbClient.listPath(self.smb_share, '*', password=None)
             access_rights["readable"] = True
-        except impacket.smbconnection.SessionError as e:
+        except SessionError:
             access_rights["readable"] = False
         
         
@@ -1328,17 +1430,18 @@ class SMBSession(object):
                 self.smbClient.createDirectory(self.smb_share, temp_dir)
                 self.smbClient.deleteDirectory(self.smb_share, temp_dir)
                 access_rights["writable"] = True
-            except impacket.smbconnection.SessionError as e:
+            except SessionError:
                 access_rights["writable"] = False
 
         # Restore the current share
         self.set_share(shareName=current_share)
+        self.smb_cwd = current_cwd
 
         return access_rights
 
     # Setter / Getter
 
-    def set_share(self, shareName):
+    def set_share(self, shareName: str):
         """
         Sets the current SMB share to the specified share name.
 
@@ -1361,16 +1464,16 @@ class SMBSession(object):
                 # Connects the tree
                 try:
                     self.smb_tree_id = self.smbClient.connectTree(self.smb_share)
-                except impacket.smbconnection.SessionError as err:
+                except SessionError as err:
                     self.smb_share = None
                     self.smb_cwd = ""
-                    self.logger.error("Could not access share '%s': %s" % (shareName, err))
+                    raise Exception("Could not access share '%s': %s" % (shareName, err))
             else:
-                self.logger.error("Could not set share '%s', it does not exist remotely." % shareName)
+                raise Exception("Could not set share '%s', it does not exist remotely." % shareName)
         else:
             self.smb_share = None
             
-    def set_cwd(self, path=None):
+    def set_cwd(self, path: Optional[str] = None):
         """
         Sets the current working directory on the SMB share to the specified path.
 
